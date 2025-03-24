@@ -64,7 +64,7 @@ class MultiAlgorithmStockPredictor:
         default_hyperparams = {
             'LSTM': {'units': 100, 'dropout': 0.2, 'epochs': 50, 'batch_size': 32},
             'SVR': {'C': 100, 'epsilon': 0.1},
-            'RandomForest': {'n_estimators': 100, 'max_depth': None},
+            'Random Forest': {'n_estimators': 100, 'max_depth': None},
             'XGBoost': {'n_estimators': 100, 'learning_rate': 0.1, 'max_depth': 3},
             'KNN': {'n_neighbors': 5},
             'GBM': {'n_estimators': 100, 'learning_rate': 0.1, 'max_depth': 3},
@@ -125,7 +125,7 @@ class MultiAlgorithmStockPredictor:
             models = {
                 'LSTM': self.build_lstm_model((X_lstm_train.shape[1], X_lstm_train.shape[2])),
                 'SVR': SVR(kernel='rbf', C=self.hyperparams['SVR']['C'], epsilon=self.hyperparams['SVR']['epsilon']),
-                'RandomForest': RandomForestRegressor(n_estimators=self.hyperparams['RandomForest']['n_estimators'], max_depth=self.hyperparams['RandomForest']['max_depth'], random_state=42),
+                'Random Forest': RandomForestRegressor(n_estimators=self.hyperparams['RandomForest']['n_estimators'], max_depth=self.hyperparams['RandomForest']['max_depth'], random_state=42),
                 'XGBoost': XGBRegressor(n_estimators=self.hyperparams['XGBoost']['n_estimators'], learning_rate=self.hyperparams['XGBoost']['learning_rate'], max_depth=self.hyperparams['XGBoost']['max_depth'], random_state=42),
                 'KNN': KNeighborsRegressor(n_neighbors=self.hyperparams['KNN']['n_neighbors']),
                 'GBM': GradientBoostingRegressor(n_estimators=self.hyperparams['GBM']['n_estimators'], learning_rate=self.hyperparams['GBM']['learning_rate'], max_depth=self.hyperparams['GBM']['max_depth'], random_state=42)
