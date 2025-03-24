@@ -19,6 +19,36 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 from src.data_fetcher import fetch_stock_data
 from src.technical_indicators import calculate_technical_indicators
 
+class MetaWeightOptimizer:
+    def __init__(self, model_names, lookback_window=90):
+        self.model_errors = {name: [] for name in model_names}
+        self.lookback = lookback_window
+        self.meta_model = XGBRegressor(objective='reg:squarederror')
+        
+    def update_errors(self, model_name, actual, predicted):
+        error = np.abs(actual - predicted)
+        self.model_errors[model_name].append(error)
+        # Maintain rolling window
+        if len(self.model_errors[model_name]) > self.lookback:
+            self.model_errors[model_name].pop(0)
+            
+    def get_current_weights(self):
+        # Create performance dataframe
+        error_df = pd.DataFrame(self.model_errors)
+        if len(error_df) < 10:  # Warm-up period
+            return {model: 1/len(self.model_errors) for model in self.model_errors}
+            
+        # Calculate relative performance
+        performance = 1 / (error_df.rolling(7).mean() + 1e-8)
+        X = performance.dropna().values
+        y = np.ones(len(X))  # Dummy target for meta-learning
+        
+        # Train meta-model on recent performance
+        self.meta_model.fit(X, y)
+        feature_importances = self.meta_model.feature_importances_
+        total = sum(feature_importances)
+        return {model: imp/total for model, imp in zip(self.model_errors.keys(), feature_importances)}
+
 class MultiAlgorithmStockPredictor:
     def __init__(self, symbol, training_years=5, weights=None, hyperparams=None):
         self.symbol = symbol
@@ -27,7 +57,11 @@ class MultiAlgorithmStockPredictor:
         self.weights = weights if weights is not None else {
             'LSTM': 0.3, 'XGBoost': 0.15, 'Random Forest': 0.15, 'ARIMA': 0.1, 'SVR': 0.1, 'GBM': 0.1, 'KNN': 0.1
         }
-        self.hyperparams = hyperparams if hyperparams is not None else {
+        self.weight_optimizer = MetaWeightOptimizer(
+            model_names=['LSTM', 'SVR', 'Random Forest', 'XGBoost', 'KNN', 'GBM', 'ARIMA']
+        )
+        # Define default hyperparameters
+        default_hyperparams = {
             'LSTM': {'units': 100, 'dropout': 0.2, 'epochs': 50, 'batch_size': 32},
             'SVR': {'C': 100, 'epsilon': 0.1},
             'RandomForest': {'n_estimators': 100, 'max_depth': None},
@@ -36,6 +70,12 @@ class MultiAlgorithmStockPredictor:
             'GBM': {'n_estimators': 100, 'learning_rate': 0.1, 'max_depth': 3},
             'ARIMA': {'order': (5, 1, 0)}
         }
+        # Merge user-provided hyperparams with defaults
+        if hyperparams is not None:
+            self.hyperparams = default_hyperparams.copy()
+            self.hyperparams.update(hyperparams)
+        else:
+            self.hyperparams = default_hyperparams.copy()
 
     def fetch_historical_data(self):
         return fetch_stock_data(self.symbol, self.training_years * 365)
@@ -98,6 +138,12 @@ class MultiAlgorithmStockPredictor:
                 else:
                     model.fit(X_other_train, y_train)
                     pred = model.predict(X_other_test)
+                
+                # Update error tracking
+                actual = y_test * (self.scaler.data_max_[0] - self.scaler.data_min_[0]) + self.scaler.data_min_[0]
+                predicted = pred * (self.scaler.data_max_[0] - self.scaler.data_min_[0]) + self.scaler.data_min_[0]
+                self.weight_optimizer.update_errors(model_name, actual.mean(), predicted.mean())
+                
                 rmse = np.sqrt(np.mean((pred - y_test)**2))
                 mae = np.mean(np.abs(pred - y_test))
                 fold_metrics[model_name] = {'RMSE': rmse, 'MAE': mae}
@@ -175,21 +221,49 @@ class MultiAlgorithmStockPredictor:
             except Exception as e:
                 st.warning(f"ARIMA prediction failed: {str(e)}")
 
-            available_models = list(predictions.keys())
-            total_weight = sum(self.weights[model] for model in available_models)
-            adjusted_weights = {model: self.weights[model]/total_weight for model in available_models}
-            ensemble_pred = sum(pred * adjusted_weights[model] for model, pred in predictions.items())
-            dummy_array = np.zeros((1, X_other.shape[1]))
-            dummy_array[0, 0] = ensemble_pred
-            final_prediction = self.scaler.inverse_transform(dummy_array)[0, 0]
-            individual_predictions = [self.scaler.inverse_transform(np.array([[pred] + [0]*(X_other.shape[1]-1)]))[0, 0] for pred in predictions.values()]
-            std_dev = np.std(individual_predictions)
+            # Dynamic weighting calculation
+            dynamic_weights = self.weight_optimizer.get_current_weights()
+            available_models = [m for m in predictions.keys() if m in dynamic_weights]
+            total_weight = sum(dynamic_weights[model] for model in available_models)
+            adjusted_weights = {model: dynamic_weights[model]/total_weight 
+                               for model in available_models}
+            
+            # Calculate ensemble prediction with proper shaping
+            ensemble_array = np.zeros((1, X_other.shape[1]))
+            ensemble_array[0, 0] = sum(pred * adjusted_weights[model] 
+                                      for model, pred in predictions.items())
+            
+            # Inverse transform ensemble prediction
+            final_prediction = self.scaler.inverse_transform(ensemble_array)[0, 0]
+
+            # Calculate individual predictions with proper shaping
+            individual_predictions = {}
+            for model_name, pred in predictions.items():
+                model_array = np.zeros((1, X_other.shape[1]))
+                model_array[0, 0] = pred
+                individual_predictions[model_name] = \
+                    self.scaler.inverse_transform(model_array)[0, 0]
+
+            # Update errors with proper array handling
+            actual_price = df['Close'].iloc[-1]
+            for model_name, pred in predictions.items():
+                model_array = np.zeros((1, X_other.shape[1]))
+                model_array[0, 0] = pred
+                predicted_price = self.scaler.inverse_transform(model_array)[0, 0]
+                self.weight_optimizer.update_errors(model_name, 
+                                                   actual_price, 
+                                                   predicted_price)
+
+            # Calculate confidence metrics
+            std_dev = np.std(list(individual_predictions.values()))
+            print(f"Current Weights: {dynamic_weights}")
             return {
                 'prediction': final_prediction,
                 'lower_bound': final_prediction - std_dev,
                 'upper_bound': final_prediction + std_dev,
                 'confidence_score': 1 / (1 + std_dev / final_prediction),
-                'individual_predictions': dict(zip(predictions.keys(), individual_predictions))
+                'individual_predictions': individual_predictions,
+                'dynamic_weights': adjusted_weights
             }
         except Exception as e:
             st.error(f"Error in prediction: {str(e)}")
